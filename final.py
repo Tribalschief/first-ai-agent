@@ -11,15 +11,12 @@ from picamera2 import Picamera2
 from RPLCD.gpio import CharLCD
 import re
 import os
-import datetime
 
 # ==================================
 #        CONFIGURATION & TUNING
 # ==================================
 DEBUG_MODE = True
 DEBUG_IMG_PATH = "debug_images_merged"
-DATABASE_FILE_PATH = "Database.txt"
-ACTIVITY_LOG_FILE_PATH = "activity_log.csv"
 
 # --- Camera (ANPR) ---
 IMG_WIDTH = 1024
@@ -36,56 +33,63 @@ MAX_ASPECT_RATIO = 5.5
 # --- OCR Preprocessing Tuning (ANPR) ---
 OCR_RESIZE_HEIGHT = 60
 THRESHOLD_METHOD = 'ADAPTIVE' # 'ADAPTIVE' or 'OTSU'
-ADAPT_THRESH_BLOCK_SIZE = 19
+ADAPT_THRESH_BLOCK_SIZE = 19 # Must be odd
 ADAPT_THRESH_C = 9
+# SERVO_CLOSED_ANGLE = 90 # Removed duplicate/conflicting definition
+# SERVO_OPEN_ANGLE = 0   # Removed duplicate/conflicting definition
+CAR_PRESENT_THRESHOLD_CM = 10 # Used for general car presence, main threshold
+
 
 # --- Tesseract Tuning (ANPR) ---
 TESS_LANG = 'eng'
 TESS_OEM = 3
-TESS_PSM = '7'
+TESS_PSM = '7' # Try '8' for single word, '7' for single line of text
 TESS_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-EXPECTED_PLATE_PATTERN = ""
+EXPECTED_PLATE_PATTERN = "" # Example: r"^[A-Z]{2}[0-9]{2}[A-Z]{3}$" (UK Style)
 
 # --- OCR Post-Processing / Validation (ANPR) ---
 MIN_PLATE_LENGTH = 5
 
 # --- ANPR Main Loop Timing ---
-PROCESS_COOLDOWN_ANPR = 8
-RESET_TIMEOUT_ANPR = 15
+PROCESS_COOLDOWN_ANPR = 8 # Seconds before processing the SAME plate again
+RESET_TIMEOUT_ANPR = 15   # Seconds of no plate contour detection before resetting anpr_last_processed_plate lock
 
 # --- Parking System Configuration ---
-CAR_PRESENT_THRESHOLD_CM = 30
+# CAR_PRESENT_THRESHOLD_CM already defined above, now used for parking slots AND the new entry US sensor
 SERVO_FREQUENCY = 50
-
-# === SERVO ANGLE CONFIGURATION ===
-# Entry Gate: "rotates at 90 then 0" -> Opens to 90, Closes to 0
-ENTRY_GATE_OPEN_ANGLE = 90
-ENTRY_GATE_CLOSED_ANGLE = 0
-
-# Exit Gate: "0 to 90" -> Opens to 0, Closes to 90
-EXIT_GATE_OPEN_ANGLE = 0
-EXIT_GATE_CLOSED_ANGLE = 90
-# =================================
-
-SERVO_MOVE_DELAY = 1.0
-GATE_OPEN_DURATION_PARKING = 3.0
-US_POLLING_INTERVAL = 1.0
-IR_POLLING_INTERVAL_MAIN_LOOP = 0.1
+SERVO_CLOSED_ANGLE = 0  # Actual used definition
+SERVO_OPEN_ANGLE = 90   # Actual used definition
+SERVO_MOVE_DELAY = 1.0      # Delay for servo to reach position
+GATE_OPEN_DURATION_PARKING = 3.0 # How long gate stays open for parking events
+US_POLLING_INTERVAL = 1.0      # How often to poll parking spot ultrasonic sensors
+IR_POLLING_INTERVAL_MAIN_LOOP = 0.1 # Main loop tick rate, also polls entry US sensor
 
 # ==================================
-#           PIN DEFINITIONS (BCM Mode)
+#           PIN DEFINITIONS (BCM Mode) - MATCHING USER IMAGES
 # ==================================
-LCD_RS_PIN = 7
-LCD_E_PIN = 8
-LCD_D4_PIN = 25
-LCD_D5_PIN = 24
-LCD_D6_PIN = 23
-LCD_D7_PIN = 12
-IR_EXIT_PIN = 22
-SERVO_ENTRY_PIN = 17
-SERVO_EXIT_PIN = 4
-BUZZ_PIN_ANPR = 2
+# --- LCD Pins ---
+LCD_RS_PIN = 7    # BCM 7 (Physical 26)
+LCD_E_PIN = 8     # BCM 8 (Physical 24)
+LCD_D4_PIN = 25   # BCM 25 (Physical 22)
+LCD_D5_PIN = 24   # BCM 24 (Physical 18)
+LCD_D6_PIN = 23   # BCM 23 (Physical 16)
+LCD_D7_PIN = 12   # BCM 12 (Physical 32)
+
+# --- IR Sensor Pin (Exit Only) ---
+# IR_ENTRY_PIN = 27 # BCM 27 (Physical 13) -- REPLACED BY US_ENTRY_SENSOR
+IR_EXIT_PIN = 22  # BCM 22 (Physical 15)
+
+# --- Servo Pins ---
+SERVO_ENTRY_PIN = 17 # BCM 17 (Physical 11) - (Entry Gate)
+SERVO_EXIT_PIN = 4   # BCM 4  (Physical 7)  - (Exit Gate)
+
+# --- ANPR Buzzer Pin ---
+BUZZ_PIN_ANPR = 2    # BCM 2 (Physical 3)
+
+# --- Ultrasonic Sensor Pin (FOR ENTRY DETECTION) ---
 US_ENTRY_SENSOR = {"name": "Entry Detect", "trig": 0, "echo": 1}
+
+# --- Ultrasonic Sensor Pins (Parking System Slots) ---
 US_SENSORS = [
     {"name": "Slot 1", "trig": 5,  "echo": 6},
     {"name": "Slot 2", "trig": 19, "echo": 26},
@@ -97,6 +101,7 @@ US_SENSORS = [
 TOTAL_PARKING_SPOTS = len(US_SENSORS)
 # ==================================
 
+# --- Create Debug Directory ---
 if DEBUG_MODE and not os.path.exists(DEBUG_IMG_PATH):
     try:
         os.makedirs(DEBUG_IMG_PATH)
@@ -105,6 +110,7 @@ if DEBUG_MODE and not os.path.exists(DEBUG_IMG_PATH):
         print(f"[ERROR] Could not create debug directory '{DEBUG_IMG_PATH}': {e}")
         DEBUG_MODE = False
 
+# --- Global Variables (Consolidated) ---
 lcd = None
 lcd_ready = False
 picam2 = None
@@ -121,29 +127,11 @@ anpr_last_processed_plate = ""
 anpr_last_process_time = 0
 anpr_last_plate_contour_detection_time = 0
 anpr_processing_active = False
+entry_us_last_detected = False
+entry_us_confirmed = False
 
-def initialize_log_file():
-    if not os.path.exists(ACTIVITY_LOG_FILE_PATH):
-        try:
-            with open(ACTIVITY_LOG_FILE_PATH, "w") as f:
-                f.write("Timestamp,EventType,Plate,Status\n")
-            print(f"Activity log file created: {ACTIVITY_LOG_FILE_PATH}")
-        except IOError as e:
-            print(f"[ERROR] Could not create activity log file {ACTIVITY_LOG_FILE_PATH}: {e}")
 
-def log_event(event_type, plate_text="N/A", status_message=""):
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    plate_text_csv = str(plate_text).replace(',', ';')
-    status_message_csv = str(status_message).replace(',', ';')
-    log_entry = f"{timestamp},{event_type},{plate_text_csv},{status_message_csv}\n"
-    try:
-        with open(ACTIVITY_LOG_FILE_PATH, "a") as f:
-            f.write(log_entry)
-        if DEBUG_MODE:
-            print(f"LOGGED: {timestamp} | {event_type} | Plate: {plate_text} | Status: {status_message}")
-    except Exception as e:
-        print(f"[ERROR] Could not write to log file {ACTIVITY_LOG_FILE_PATH}: {e}")
-
+# --- LCD Setup Function ---
 def setup_lcd():
     global lcd, lcd_ready
     try:
@@ -164,20 +152,28 @@ def setup_lcd():
             def write_string(self, text): pass
             def clear(self): pass
             def cursor_pos(self, pos): pass
+            def lcd_display_merged(self, line1, line2, clear_first=False): pass # Add dummy method
         lcd = DummyLCD()
 
-def lcd_display_merged(line1, line2="", clear_first=True):
-    if not lcd_ready: return
-    try:
-        if clear_first: lcd.clear()
-        lcd.cursor_pos = (0, 0)
-        lcd.write_string(str(line1)[:16])
-        if line2:
+# Dummy display function if LCD fails or for global use before lcd is confirmed
+def lcd_display_merged(line1, line2, clear_first=False):
+    global lcd, lcd_ready
+    if lcd_ready and lcd:
+        try:
+            if clear_first: lcd.clear()
+            lcd.cursor_pos = (0, 0)
+            lcd.write_string(line1.ljust(16)[:16])
             lcd.cursor_pos = (1, 0)
-            lcd.write_string(str(line2)[:16])
-    except Exception as e:
-        print(f"[ERROR] LCD display error: {e}")
+            lcd.write_string(line2.ljust(16)[:16])
+        except Exception as e:
+            print(f"[ERROR] LCD write error: {e}")
+            # lcd_ready = False # Optionally mark LCD as not ready on error
+    else:
+        # Fallback print if LCD not working
+        print(f"LCD_Simulate: L1: {line1} | L2: {line2}")
 
+
+# --- Camera Setup (ANPR) ---
 def setup_camera():
     global picam2, camera_ready
     try:
@@ -185,29 +181,39 @@ def setup_camera():
         config = picam2.create_preview_configuration(main={"size": (IMG_WIDTH, IMG_HEIGHT)})
         picam2.configure(config)
         picam2.start()
-        time.sleep(2.0)
+        time.sleep(2.0) # Allow camera to initialize
         camera_ready = True
         print("Camera Initialized for ANPR.")
     except Exception as e:
         print(f"[ERROR] Failed to initialize Camera: {e}")
         camera_ready = False
+        # lcd_display_merged("Camera InitFail", "ANPR May Fail") # Potentially display on LCD
 
+# --- GPIO Setup ---
 def setup_gpio():
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
+    # IR Sensor (Exit only)
     GPIO.setup(IR_EXIT_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    # Ultrasonic Sensor (Entry Detection)
     GPIO.setup(US_ENTRY_SENSOR["trig"], GPIO.OUT)
     GPIO.setup(US_ENTRY_SENSOR["echo"], GPIO.IN)
     GPIO.output(US_ENTRY_SENSOR["trig"], False)
+
+    # Ultrasonic Sensors (Parking Slots)
     for sensor in US_SENSORS:
         GPIO.setup(sensor["trig"], GPIO.OUT)
         GPIO.setup(sensor["echo"], GPIO.IN)
         GPIO.output(sensor["trig"], False)
+    # Servos
     GPIO.setup(SERVO_ENTRY_PIN, GPIO.OUT)
     GPIO.setup(SERVO_EXIT_PIN, GPIO.OUT)
+    # ANPR Buzzer
     GPIO.setup(BUZZ_PIN_ANPR, GPIO.OUT, initial=GPIO.LOW)
     print("GPIO Initialized.")
 
+# --- Servo Control ---
 def setup_servos():
     global servo_entry_pwm, servo_exit_pwm
     try:
@@ -215,14 +221,9 @@ def setup_servos():
         servo_exit_pwm = GPIO.PWM(SERVO_EXIT_PIN, SERVO_FREQUENCY)
         servo_entry_pwm.start(0)
         servo_exit_pwm.start(0)
-        
-        print("Initializing servos to their respective closed positions...")
-        # Initialize Entry gate to its defined closed angle
-        set_servo_angle_parking(servo_entry_pwm, ENTRY_GATE_CLOSED_ANGLE, "Entry Initial Close")
-        # Initialize Exit gate to its defined closed angle
-        set_servo_angle_parking(servo_exit_pwm, EXIT_GATE_CLOSED_ANGLE, "Exit Initial Close")
-        
-        print("Servos Initialized.")
+        set_servo_angle_parking(servo_entry_pwm, SERVO_CLOSED_ANGLE, "Entry Initial")
+        set_servo_angle_parking(servo_exit_pwm, SERVO_CLOSED_ANGLE, "Exit Initial")
+        print("Servos Initialized and Closed.")
     except Exception as e:
         print(f"[ERROR] Failed to initialize servos: {e}")
 
@@ -230,42 +231,41 @@ def set_servo_angle_parking(servo_pwm, angle, gate_name_debug=""):
     if servo_pwm is None:
         print(f"[WARN] Servo {gate_name_debug} not available for angle set.")
         return
-    if not (0 <= angle <= 180):
-        print(f"[WARN] Servo angle {angle} for {gate_name_debug} is out of 0-180 range. Clamping.")
-        angle = max(0, min(180, angle))
-    duty = (angle / 180.0) * 5.0 + 5.0
+    duty = (angle / 18.0) + 2.0
     servo_pwm.ChangeDutyCycle(duty)
-    if DEBUG_MODE:
-        print(f"SERVO {gate_name_debug}: Set angle {angle} -> duty {duty:.2f}%")
     time.sleep(SERVO_MOVE_DELAY)
+    servo_pwm.ChangeDutyCycle(0)
 
-# Modified to take specific open_angle
-def open_gate_parking(servo_pwm_obj, gate_name, target_open_angle):
+def open_gate_parking(servo_pwm_obj, gate_name):
+    global anpr_processing_active # to control LCD display logic
     display_line1 = f"{gate_name} Gate"
     display_line2 = "Opening..."
-    lcd_display_merged(display_line1, display_line2, clear_first=True)
-    print(f"Opening {gate_name} gate to angle {target_open_angle}...")
-    set_servo_angle_parking(servo_pwm_obj, target_open_angle, f"{gate_name} Open")
-    print(f"{gate_name} gate OPEN at angle {target_open_angle}.")
+    # Avoid clearing LCD if ANPR is active and this is entry gate, to preserve ANPR messages
+    clear_lcd = not (anpr_processing_active and gate_name == "Entry")
+    lcd_display_merged(display_line1, display_line2, clear_first=clear_lcd)
+    print(f"Opening {gate_name} gate...")
+    set_servo_angle_parking(servo_pwm_obj, SERVO_OPEN_ANGLE, gate_name)
+    print(f"{gate_name} gate OPEN.")
 
-# Modified to take specific closed_angle
-def close_gate_parking(servo_pwm_obj, gate_name, target_closed_angle):
-    lcd_display_merged(f"{gate_name} Gate", "Closing...", clear_first=True)
-    print(f"Closing {gate_name} gate to angle {target_closed_angle}...")
-    set_servo_angle_parking(servo_pwm_obj, target_closed_angle, f"{gate_name} Close")
-    print(f"{gate_name} gate CLOSED at angle {target_closed_angle}.")
+def close_gate_parking(servo_pwm_obj, gate_name):
+    lcd_display_merged(f"{gate_name} Gate", "Closing...")
+    print(f"Closing {gate_name} gate...")
+    set_servo_angle_parking(servo_pwm_obj, SERVO_CLOSED_ANGLE, gate_name)
+    print(f"{gate_name} gate CLOSED.")
 
+# --- IR Sensor Functions ---
 def read_ir_sensor(pin):
     return GPIO.input(pin) == GPIO.LOW
 
+# --- Ultrasonic Sensor Functions ---
 def measure_distance(trig_pin, echo_pin):
     GPIO.output(trig_pin, False)
-    time.sleep(0.01) 
+    time.sleep(0.01)
     GPIO.output(trig_pin, True)
-    time.sleep(0.00001) 
+    time.sleep(0.00001)
     GPIO.output(trig_pin, False)
     start_time, end_time = time.time(), time.time()
-    timeout_limit = 0.1 
+    timeout_limit = 0.1
     loop_start_time = time.time()
     while GPIO.input(echo_pin) == 0:
         start_time = time.time()
@@ -278,6 +278,7 @@ def measure_distance(trig_pin, echo_pin):
     distance = (duration * 34300) / 2
     return distance if distance >= 0 else float('inf')
 
+# --- ANPR Image Processing & OCR ---
 def perspective_transform(image, pts):
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -303,14 +304,13 @@ def capture_image_anpr():
         print("[ERROR-ANPR] Camera not ready for capture.")
         return None
     try:
-        frame = picam2.capture_array("main")
-        if frame.shape[2] == 4:
+        # Capture as an array, then convert color space if needed
+        frame = picam2.capture_array("main") #  Picamera2 captures in RGB by default for "main"
+        # OpenCV expects BGR, so convert RGB to BGR
+        if frame.shape[2] == 4: # RGBA
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-        elif frame.shape[2] == 3:
+        else: # RGB
             frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        else:
-            print(f"[ERROR-ANPR] Unexpected frame format: {frame.shape}")
-            return None
         return frame_bgr
     except Exception as e:
         print(f"[ERROR-ANPR] Image capture failed: {e}")
@@ -334,7 +334,7 @@ def plate_extraction_anpr(image_color):
         if len(approx) == 4:
             (x, y, w, h) = cv2.boundingRect(approx)
             aspect_ratio = w / float(h) if h > 0 else 0
-            area = cv2.contourArea(approx)
+            area = cv2.contourArea(approx) # Use area of the polygon itself
             if MIN_PLATE_AREA < area and MIN_ASPECT_RATIO < aspect_ratio < MAX_ASPECT_RATIO:
                 plate_contour_found = approx
                 if DEBUG_MODE:
@@ -346,7 +346,7 @@ def plate_extraction_anpr(image_color):
         if DEBUG_MODE: print("  ANPR plate_extraction: No suitable contour found.")
         return None
     pts = plate_contour_found.reshape(4, 2)
-    warped_plate_gray = perspective_transform(gray, pts)
+    warped_plate_gray = perspective_transform(gray, pts) # Use original gray, not image_color
     if warped_plate_gray is None or warped_plate_gray.size == 0:
         if DEBUG_MODE: print("  ANPR plate_extraction: Warped plate is empty.")
         return None
@@ -356,40 +356,48 @@ def plate_extraction_anpr(image_color):
 def ocr_processing_anpr(plate_image_gray):
     global anpr_last_plate_contour_detection_time
     if plate_image_gray is None or plate_image_gray.size == 0: return ""
-    anpr_last_plate_contour_detection_time = time.time()
+    anpr_last_plate_contour_detection_time = time.time() # Update time if we attempt OCR
+
     try:
         h_orig, w_orig = plate_image_gray.shape[:2]
         aspect_ratio_orig = w_orig / float(h_orig) if h_orig > 0 else 1.0
         target_width = int(OCR_RESIZE_HEIGHT * aspect_ratio_orig)
-        if target_width > 0 and OCR_RESIZE_HEIGHT > 0:
+        if target_width > 0: # Ensure target_width is positive
             plate_image_resized = cv2.resize(plate_image_gray, (target_width, OCR_RESIZE_HEIGHT), interpolation=cv2.INTER_LANCZOS4)
-        else: plate_image_resized = plate_image_gray
+        else: # If target_width calculation fails, use original image
+            plate_image_resized = plate_image_gray
     except Exception as e:
         print(f"[WARN-ANPR] Plate resize failed: {e}. Using original.")
-        plate_image_resized = plate_image_gray
+        plate_image_resized = plate_image_gray # Fallback to original if resize fails
+
     if THRESHOLD_METHOD == 'ADAPTIVE':
         binary_plate = cv2.adaptiveThreshold(plate_image_resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, ADAPT_THRESH_BLOCK_SIZE, ADAPT_THRESH_C)
     elif THRESHOLD_METHOD == 'OTSU':
-        _, binary_plate = cv2.threshold(plate_image_resized, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    else:
-        _, binary_plate = cv2.threshold(plate_image_resized, 127, 255, cv2.THRESH_BINARY_INV)
+        # Apply Gaussian blur before Otsu for better results
+        blurred_for_otsu = cv2.GaussianBlur(plate_image_resized, (5,5), 0)
+        _, binary_plate = cv2.threshold(blurred_for_otsu, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    else: # Default
+        print(f"[WARN-ANPR] Unknown THRESHOLD_METHOD '{THRESHOLD_METHOD}'. Defaulting to ADAPTIVE.")
+        binary_plate = cv2.adaptiveThreshold(plate_image_resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, ADAPT_THRESH_BLOCK_SIZE, ADAPT_THRESH_C)
+
     ts_for_debug = int(time.time())
     if DEBUG_MODE: cv2.imwrite(os.path.join(DEBUG_IMG_PATH, f"{ts_for_debug}_anpr_04_binary.png"), binary_plate)
+
     custom_config = f'--oem {TESS_OEM} --psm {TESS_PSM} -l {TESS_LANG}'
     if TESS_WHITELIST: custom_config += f' -c tessedit_char_whitelist={TESS_WHITELIST}'
     try:
         raw_text = pytesseract.image_to_string(binary_plate, config=custom_config)
         if DEBUG_MODE: print(f"  ANPR Raw OCR: '{raw_text.strip()}'")
-        cleaned_text = ''.join(filter(str.isalnum, raw_text)).upper()
-        if not cleaned_text:
-             if DEBUG_MODE: print(f"  ANPR Reject (empty after clean): '{raw_text.strip()}'")
-             return ""
+        cleaned_text = ''.join(filter(str.isalnum, raw_text)).upper() # Clean and uppercase
+
         if len(cleaned_text) < MIN_PLATE_LENGTH:
-            if DEBUG_MODE: print(f"  ANPR Reject (short): '{cleaned_text}' len {len(cleaned_text)}")
-            return ""
+            if DEBUG_MODE and cleaned_text: print(f"  ANPR Reject (short): '{cleaned_text}' len {len(cleaned_text)}")
+            return "" # Too short
+
         if EXPECTED_PLATE_PATTERN and not re.fullmatch(EXPECTED_PLATE_PATTERN, cleaned_text):
             if DEBUG_MODE: print(f"  ANPR Reject (pattern mismatch): '{cleaned_text}' vs pattern '{EXPECTED_PLATE_PATTERN}'")
-            return ""
+            return "" # Does not match expected pattern
+
         return cleaned_text
     except pytesseract.TesseractNotFoundError:
         print("[ERROR-ANPR] Tesseract not found. Please ensure it's installed and in PATH.")
@@ -399,249 +407,359 @@ def ocr_processing_anpr(plate_image_gray):
         return ""
 
 def check_database_anpr(plate_text):
-    if not plate_text: return False
+    if not plate_text: return False # Cannot check an empty plate
     try:
-        with open(DATABASE_FILE_PATH, 'r') as f:
-            database_plates = {line.strip().upper() for line in f if line.strip()}
+        with open('Database.txt', 'r') as f:
+            database_plates = {line.strip().upper() for line in f if line.strip()} # Read and uppercase
         return plate_text in database_plates
     except FileNotFoundError:
-        print(f"[ERROR-ANPR] {DATABASE_FILE_PATH} not found! Attempting to create an empty one.")
+        print("[ERROR-ANPR] Database.txt not found! Attempting to create an empty one.")
         try:
-            with open(DATABASE_FILE_PATH, 'w') as f: pass
-            print(f"[INFO-ANPR] Created empty {DATABASE_FILE_PATH}. Add plate numbers to it.")
-        except IOError: print(f"[ERROR-ANPR] Could not create {DATABASE_FILE_PATH} due to IO error.")
-        return False
+            with open('Database.txt', 'w') as f: pass # Create empty file
+            print("[INFO-ANPR] Created empty Database.txt. Add plate numbers to it.")
+        except IOError: print("[ERROR-ANPR] Could not create Database.txt due to IO error.")
+        return False # Assume not registered if DB not found
     except Exception as e:
         print(f"[ERROR-ANPR] Database read error: {e}")
         return False
 
+# --- Parking System Logic ---
 def update_parking_spots_status():
     global occupied_spots_status, previous_occupied_spots_status, available_spots_count, last_us_poll_time
     current_time_us_poll = time.time()
     if current_time_us_poll - last_us_poll_time < US_POLLING_INTERVAL:
-        return
+        return # Not time to poll parking spots yet
+
     new_occupied_count = 0
     changed_slots_this_poll = False
-    for i, sensor_info in enumerate(US_SENSORS):
+    for i, sensor_info in enumerate(US_SENSORS): # Iterate ONLY parking slot sensors
         dist = measure_distance(sensor_info["trig"], sensor_info["echo"])
-        current_spot_is_occupied = (dist < CAR_PRESENT_THRESHOLD_CM)
+        current_spot_is_occupied = (dist < CAR_PRESENT_THRESHOLD_CM and dist != float('inf')) # Check for valid reading too
         if current_spot_is_occupied != previous_occupied_spots_status[i]:
             changed_slots_this_poll = True
             print(f"PARKING: Slot {sensor_info['name']} is now {'OCCUPIED' if current_spot_is_occupied else 'EMPTY'} (Dist: {dist:.1f}cm)")
         occupied_spots_status[i] = current_spot_is_occupied
         if current_spot_is_occupied: new_occupied_count += 1
-    new_available_spots = TOTAL_PARKING_SPOTS - new_occupied_count
-    if new_available_spots != available_spots_count:
-        print(f"PARKING: Available spots updated from {available_spots_count} to {new_available_spots}")
-        available_spots_count = new_available_spots
+
+    available_spots_count = TOTAL_PARKING_SPOTS - new_occupied_count
     if changed_slots_this_poll:
-        previous_occupied_spots_status = list(occupied_spots_status)
+        previous_occupied_spots_status = list(occupied_spots_status) # Update previous status
+        # Optionally, display update immediately if status changed and no other critical message is on LCD
+        if not (anpr_processing_active or entry_gate_busy or exit_gate_busy):
+            display_parking_main_status_lcd() # Update LCD if parking status changed
+
     last_us_poll_time = current_time_us_poll
 
 def display_parking_main_status_lcd():
     global available_spots_count
-    if anpr_processing_active or entry_gate_busy or exit_gate_busy: return
+    # This function should only update LCD if no other higher priority message is being shown
+    if anpr_processing_active or entry_gate_busy or exit_gate_busy:
+        return
+
     status_line1 = "Spots Available"
     status_line2 = f"{available_spots_count} Free"
     if available_spots_count == TOTAL_PARKING_SPOTS:
         status_line1 = "Parking Empty"
-        status_line2 = f"{available_spots_count} Free"
-    elif available_spots_count <= 0:
-        available_spots_count = 0
+    elif available_spots_count == 0:
         status_line1 = "Parking Full!"
         status_line2 = "No Spots Free"
     lcd_display_merged(status_line1, status_line2, clear_first=True)
 
+
 def run_anpr_entry_sequence():
-    global anpr_last_processed_plate, anpr_last_process_time, available_spots_count
+    global anpr_last_processed_plate, anpr_last_process_time, available_spots_count, camera_ready
+
+    if not camera_ready:
+        print("ANPR: Camera not ready. Attempting entry based on availability only.")
+        lcd_display_merged("Camera Issue", "Checking Spots", clear_first=True)
+        if available_spots_count <= 0:
+            lcd_display_merged("Parking Full!", "Entry Blocked", clear_first=True)
+            print("[PARKING FULL] No access due to no space (camera inactive).")
+            time.sleep(1.5) # Give time to read message
+            return False
+
+        lcd_display_merged("Space Available", "Access Granted", clear_first=True)
+        GPIO.output(BUZZ_PIN_ANPR, GPIO.HIGH); time.sleep(0.5); GPIO.output(BUZZ_PIN_ANPR, GPIO.LOW)
+        open_gate_parking(servo_entry_pwm, "Entry")
+        time.sleep(GATE_OPEN_DURATION_PARKING)
+        close_gate_parking(servo_entry_pwm, "Entry")
+
+        entry_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        with open("procedure.txt", "a") as log:
+            log.write(f"[ENTRY] Plate: UNKNOWN (No Camera) | Entry Time: {entry_time_str}\n")
+        print(f"[NO CAMERA] Generic entry logged at {entry_time_str}.")
+        # anpr_last_processed_plate remains as it was (likely empty or stale)
+        # No timer file specific to this "UNKNOWN" entry is created to avoid conflicts
+        return True # Sequence handled, car allowed in
+
+    # --- Normal ANPR flow if camera is ready ---
     print("\nANPR: Car detected at entry (US). Initiating plate recognition...")
     lcd_display_merged("Car at Entry", "Reading Plate...", clear_first=True)
+
     frame_color = capture_image_anpr()
     if frame_color is None:
         lcd_display_merged("Camera Error", "Try Again Soon", clear_first=True)
-        print("ANPR: Failed to capture frame for entry.")
-        log_event("ENTRY", status_message="Camera Error")
-        time.sleep(2); return False
-    extracted_plate_img_gray = plate_extraction_anpr(frame_color)
-    if extracted_plate_img_gray is not None:
-        plate_text_ocr = ocr_processing_anpr(extracted_plate_img_gray)
-        if plate_text_ocr:
-            current_time = time.time()
-            if (plate_text_ocr == anpr_last_processed_plate) and \
-               (current_time - anpr_last_process_time < PROCESS_COOLDOWN_ANPR):
-                print(f"ANPR: Ignoring '{plate_text_ocr}' (recently processed / cooldown).")
-                return False
-            print(f"ANPR Detected: '{plate_text_ocr}'", end=' ')
-            lcd_display_merged("Plate: " + plate_text_ocr, "Checking DB...", clear_first=True)
-            time.sleep(0.5)
-            is_registered = check_database_anpr(plate_text_ocr)
-            anpr_last_processed_plate = plate_text_ocr
-            anpr_last_process_time = time.time()
-            if is_registered:
-                if available_spots_count > 0:
-                    print("[REGISTERED] ✅ Access Granted!")
-                    lcd_display_merged(plate_text_ocr, "Access Granted", clear_first=True)
-                    log_event("ENTRY", plate_text_ocr, "Access Granted")
-                    GPIO.output(BUZZ_PIN_ANPR, GPIO.HIGH); time.sleep(0.5); GPIO.output(BUZZ_PIN_ANPR, GPIO.LOW)
-                    
-                    # Use ENTRY specific angles
-                    open_gate_parking(servo_entry_pwm, "Entry", ENTRY_GATE_OPEN_ANGLE)
-                    time.sleep(GATE_OPEN_DURATION_PARKING)
-                    close_gate_parking(servo_entry_pwm, "Entry", ENTRY_GATE_CLOSED_ANGLE)
-                    
-                    print(f"ANPR -> Granted '{plate_text_ocr}'. Gate operated. Cooldown started.")
-                    return True
-                else:
-                    print("[REGISTERED] BUT PARKING FULL ❌ Access Denied!")
-                    lcd_display_merged(plate_text_ocr, "Parking Full!", clear_first=True)
-                    log_event("ENTRY", plate_text_ocr, "Denied - Parking Full")
-                    for _ in range(3): GPIO.output(BUZZ_PIN_ANPR, GPIO.HIGH); time.sleep(0.1); GPIO.output(BUZZ_PIN_ANPR, GPIO.LOW); time.sleep(0.1)
-                    time.sleep(1.5)
-                    return False
-            else:
-                print("[UNREGISTERED] ❌ Access Denied!")
-                lcd_display_merged(plate_text_ocr, "Access Denied", clear_first=True)
-                log_event("ENTRY", plate_text_ocr, "Denied - Unregistered")
-                for _ in range(3): GPIO.output(BUZZ_PIN_ANPR, GPIO.HIGH); time.sleep(0.1); GPIO.output(BUZZ_PIN_ANPR, GPIO.LOW); time.sleep(0.1)
-                time.sleep(1.5)
-                return False
-        else:
-            print("ANPR: Contour found, but OCR failed to read plate text.")
-            lcd_display_merged("Plate Found", "OCR Failed", clear_first=True)
-            log_event("ENTRY", status_message="Denied - OCR Failed")
-            time.sleep(1.5)
-            return False
-    else:
-        print("ANPR: No plate-like contour detected in the image.")
-        lcd_display_merged("No Plate Found", "Try Reposition", clear_first=True)
-        log_event("ENTRY", status_message="Denied - No Plate Detected")
-        time.sleep(1.5)
+        print("ANPR: Failed to capture frame.")
+        time.sleep(2)
         return False
 
+    extracted_plate_img_gray = plate_extraction_anpr(frame_color)
+    if extracted_plate_img_gray is not None:
+        plate_text = ocr_processing_anpr(extracted_plate_img_gray)
+        if plate_text: # A non-empty plate text was recognized
+            current_time = time.time()
+            if plate_text == anpr_last_processed_plate and (current_time - anpr_last_process_time < PROCESS_COOLDOWN_ANPR):
+                print(f"ANPR: Ignoring {plate_text} (cooldown). Plate still locked.")
+                # Potentially show "Plate recognized, waiting cooldown"
+                lcd_display_merged(f"Plate: {plate_text[:8]}..", "In Cooldown", clear_first=True) # Display part of plate
+                time.sleep(1.5)
+                return False # Indicate that processing was intentionally skipped
+
+            print(f"ANPR Detected: {plate_text}")
+            lcd_display_merged(f"Plate: {plate_text}", "Checking DB...", clear_first=True)
+            time.sleep(0.5)
+
+            is_registered = check_database_anpr(plate_text)
+            registration_status_msg = "Registered" if is_registered else "Unregistered"
+            print(f"ANPR: Plate {plate_text} is {registration_status_msg}.")
+
+
+            if available_spots_count <= 0:
+                lcd_display_merged("Parking Full!", f"{plate_text[:8]}.. Denied", clear_first=True)
+                print(f"[PARKING FULL] No access for {plate_text}.")
+                time.sleep(1.5)
+                return False # Gate does not open if full
+
+            # Open gate (regardless of registration, as per original logic, but now we have plate info)
+            lcd_display_merged(f"{plate_text[:9]} {registration_status_msg[:6]}", "Access Granted", clear_first=True)
+            GPIO.output(BUZZ_PIN_ANPR, GPIO.HIGH); time.sleep(0.5); GPIO.output(BUZZ_PIN_ANPR, GPIO.LOW) # Buzzer
+            open_gate_parking(servo_entry_pwm, "Entry")
+            time.sleep(GATE_OPEN_DURATION_PARKING)
+            close_gate_parking(servo_entry_pwm, "Entry")
+
+            entry_time_val = time.time()
+            entry_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry_time_val))
+            
+            log_message_suffix = "Registered" if is_registered else "Unregistered"
+            with open("procedure.txt", "a") as log:
+                log.write(f"[ENTRY] Plate: {plate_text} ({log_message_suffix}) | Entry Time: {entry_time_str}\n")
+
+            if not is_registered and plate_text: # Ensure plate_text is valid before creating file
+                timer_file_path = f"{plate_text}_start.txt"
+                try:
+                    with open(timer_file_path, "w") as f:
+                        f.write(str(entry_time_val))
+                    print(f"[UNREGISTERED] Timer started for {plate_text} and entry logged.")
+                except IOError as e:
+                    print(f"[ERROR] Could not write timer file {timer_file_path}: {e}")
+            else:
+                print(f"[REGISTERED] Entry logged for {plate_text}. No timer file needed or plate invalid for timer.")
+
+
+            anpr_last_processed_plate = plate_text # Update last processed plate
+            anpr_last_process_time = current_time # Update time of this processing
+            return True # Success
+        else: # OCR failed to produce text
+            lcd_display_merged("Plate Found", "OCR Failed", clear_first=True)
+            print("ANPR: OCR failed or plate invalid after cleaning.")
+            time.sleep(1.5)
+    else: # Plate contour not found
+        lcd_display_merged("No Plate Found", "Try Reposition", clear_first=True)
+        print("ANPR: No plate contour found.")
+        time.sleep(1.5)
+
+    return False # ANPR sequence did not lead to gate opening for a specific plate
+
+
+# --- MERGED Main Loop ---
 def merged_main_loop():
     global entry_gate_busy, exit_gate_busy, anpr_processing_active
-    global anpr_last_processed_plate, anpr_last_plate_contour_detection_time, anpr_last_process_time, available_spots_count
+    global anpr_last_processed_plate, anpr_last_plate_contour_detection_time, anpr_last_process_time
+    global entry_us_last_detected, entry_us_confirmed, available_spots_count
+
     current_time = time.time()
 
-    if anpr_last_processed_plate and (current_time - anpr_last_plate_contour_detection_time > RESET_TIMEOUT_ANPR):
-        print(f"\nANPR: Resetting lock for plate '{anpr_last_processed_plate}' due to no plate contour detection for {RESET_TIMEOUT_ANPR}s.")
+    # --- ANPR Cooldown/Reset Logic ---
+    if (anpr_last_processed_plate != "" and # Only if a plate is locked
+        current_time - anpr_last_plate_contour_detection_time > RESET_TIMEOUT_ANPR):
+        print(f"\nANPR: Resetting lock for plate '{anpr_last_processed_plate}' due to ANPR inactivity ({RESET_TIMEOUT_ANPR}s).")
         anpr_last_processed_plate = ""
+        anpr_last_process_time = 0 # Reset last process time as well
+        # Update LCD if no other activity is ongoing
         if not (anpr_processing_active or entry_gate_busy or exit_gate_busy):
-             display_parking_main_status_lcd()
-    
-    entry_us_distance = measure_distance(US_ENTRY_SENSOR["trig"], US_ENTRY_SENSOR["echo"])
-    entry_vehicle_detected = (entry_us_distance < CAR_PRESENT_THRESHOLD_CM)
+             lcd_display_merged("System Ready", f"Spots: {available_spots_count}", clear_first=True)
+    # Always update contour detection time if it's stale to avoid immediate reset on next cycle if OCR didn't run
+    if anpr_last_plate_contour_detection_time == 0 : anpr_last_plate_contour_detection_time = current_time
 
-    if entry_vehicle_detected and not entry_gate_busy and not anpr_processing_active and not exit_gate_busy:
-        if DEBUG_MODE: print(f"DEBUG: Entry US detected vehicle at {entry_us_distance:.1f}cm. Threshold: {CAR_PRESENT_THRESHOLD_CM}cm")
-        anpr_processing_active = True
-        entry_gate_busy = True
-        run_anpr_entry_sequence()
-        anpr_processing_active = False
-        entry_gate_busy = False
-        display_parking_main_status_lcd()
-    elif not entry_vehicle_detected and DEBUG_MODE and entry_us_distance != float('inf') and entry_us_distance < (CAR_PRESENT_THRESHOLD_CM + 70):
+
+    # --- Entry US Sensor & ANPR/Entry Sequence ---
+    entry_us_distance = measure_distance(US_ENTRY_SENSOR["trig"], US_ENTRY_SENSOR["echo"])
+    entry_vehicle_present_at_us = (entry_us_distance < CAR_PRESENT_THRESHOLD_CM and entry_us_distance != float('inf'))
+
+    # Debounce logic for entry ultrasonic sensor
+    if entry_vehicle_present_at_us:
+        if entry_us_last_detected: # Vehicle was detected in the previous poll too
+            entry_us_confirmed = True
+        else: # First time vehicle is detected in this potential sequence
+            entry_us_last_detected = True
+            entry_us_confirmed = False # Requires a second confirmation
+    else: # No vehicle detected (or sensor error)
+        entry_us_last_detected = False
+        entry_us_confirmed = False
+
+    if entry_us_confirmed and not entry_gate_busy and not anpr_processing_active and not exit_gate_busy:
+        if DEBUG_MODE: print(f"DEBUG: Entry US confirmed vehicle at {entry_us_distance:.1f}cm.")
+        anpr_processing_active = True # Set flag before calling ANPR
+        entry_gate_busy = True      # Mark entry gate as busy
+
+        run_anpr_entry_sequence() # This function handles LCD messages during its operation
+
+        anpr_processing_active = False # Clear flag after ANPR
+        entry_gate_busy = False       # Clear busy flag
+        # After ANPR, anpr_last_processed_plate might be reset by timeout logic above, or main status displayed.
+        # Re-display main status if appropriate (will be handled by logic at end of loop)
+
+    elif not entry_vehicle_present_at_us and DEBUG_MODE and entry_us_distance != float('inf'):
+        # Optional: print entry US distance when no vehicle is detected for tuning
+        # print(f"DEBUG: Entry US clear, dist: {entry_us_distance:.1f}cm")
         pass
 
+
+    # --- Exit IR & Gate Sequence ---
     exit_ir_active = read_ir_sensor(IR_EXIT_PIN)
     if exit_ir_active and not exit_gate_busy and not entry_gate_busy and not anpr_processing_active:
         exit_gate_busy = True
         print("\nPARKING: Car detected at exit (IR).")
         lcd_display_merged("Car Exiting...", "Gate Opening", clear_first=True)
-        
-        # Use EXIT specific angles
-        open_gate_parking(servo_exit_pwm, "Exit", EXIT_GATE_OPEN_ANGLE)
+        open_gate_parking(servo_exit_pwm, "Exit")
         time.sleep(GATE_OPEN_DURATION_PARKING)
-        close_gate_parking(servo_exit_pwm, "Exit", EXIT_GATE_CLOSED_ANGLE)
+        close_gate_parking(servo_exit_pwm, "Exit")
         
-        log_event("EXIT", status_message="Vehicle Exited - Gate Cycled")
-        lcd_display_merged("Car Exited", "Thank You!", clear_first=True); time.sleep(1)
-        exit_gate_busy = False
-        display_parking_main_status_lcd()
+        # --- MOVED AND CORRECTED EXIT LOGGING LOGIC ---
+        current_exit_time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        log_file_name = "procedure.txt"
+        timer_file_path = f"{anpr_last_processed_plate}_start.txt" if anpr_last_processed_plate else ""
 
-    update_parking_spots_status()
+        try:
+            if anpr_last_processed_plate and os.path.exists(timer_file_path):
+                with open(timer_file_path, "r") as f:
+                    start_time_val = float(f.read().strip())
+                end_time_val = time.time()
+                duration_seconds = end_time_val - start_time_val
+                
+                with open(log_file_name, "a") as log:
+                    log.write(f"[EXIT] Plate: {anpr_last_processed_plate} | Duration: {duration_seconds:.1f} sec | Exit Time: {current_exit_time_str}\n")
+                
+                try: # Try to remove the timer file
+                    os.remove(timer_file_path)
+                    print(f"[LOGGED & CLEARED] {anpr_last_processed_plate} stayed for {duration_seconds:.1f} seconds. Timer file removed.")
+                except OSError as e_remove:
+                    print(f"[WARNING] Could not remove timer file {timer_file_path}: {e_remove}")
+
+                # Reset anpr_last_processed_plate after successful exit and logging of a timed car
+                # to prevent re-logging the same car if it somehow triggers exit again quickly
+                # and to free up the "lock" for new entries.
+                anpr_last_processed_plate = ""
+                anpr_last_process_time = 0
+
+            else: # No valid plate from ANPR for this exit, or timer file not found
+                with open(log_file_name, "a") as log:
+                    plate_to_log = anpr_last_processed_plate if anpr_last_processed_plate else "UNKNOWN"
+                    log.write(f"[EXIT] Plate: {plate_to_log} | Exit Time: {current_exit_time_str} | Duration: N/A (timer file not found or plate unknown)\n")
+                print(f"[LOGGED] Generic exit for plate '{plate_to_log}' or unknown. Duration N/A.")
+                if not anpr_last_processed_plate:
+                     print(f"    (No specific plate was associated with this exit)")
+                elif timer_file_path:
+                     print(f"    (Timer file '{timer_file_path}' was not found)")
+
+
+        except Exception as e:
+            print(f"[WARNING] Exit log or timer processing failed: {e}")
+        # --- END OF MOVED EXIT LOGGING ---
+
+        lcd_display_merged("Car Exited", "Thank You!", clear_first=True)
+        time.sleep(1.5) # Display message a bit longer
+        exit_gate_busy = False
+
+
+    # --- Parking Spot Status Update ---
+    update_parking_spots_status() # This will now also call display_parking_main_status_lcd if appropriate
+
+    # --- Default LCD Display (if no other activity) ---
     if not (entry_gate_busy or exit_gate_busy or anpr_processing_active):
         display_parking_main_status_lcd()
+
 
 # --- Main Execution ---
 if __name__ == "__main__":
     try:
+        # --- Pre-run Checks ---
         try:
             tesseract_version = pytesseract.get_tesseract_version()
             print(f"Tesseract version: {tesseract_version} found.")
         except pytesseract.TesseractNotFoundError:
             print("[FATAL ERROR] Tesseract OCR not installed or not found in PATH.")
-            print("Please install Tesseract: sudo apt-get install tesseract-ocr")
+            print("Please install Tesseract and ensure 'tesseract' command is in your system's PATH.")
             exit(1)
 
-        if not os.path.exists(DATABASE_FILE_PATH):
-            print(f"[WARNING] {DATABASE_FILE_PATH} not found. Creating an empty one.")
+        if not os.path.exists('Database.txt'):
+            print("[WARNING] Database.txt not found. Creating an empty one.")
             try:
-                with open(DATABASE_FILE_PATH, 'w') as f: pass
-                print(f"[INFO] Created empty {DATABASE_FILE_PATH}. Add whitelisted plates to it, one per line.")
-            except IOError as e: print(f"[ERROR] Could not create {DATABASE_FILE_PATH}: {e}")
+                with open('Database.txt', 'w') as f: pass
+                print("[INFO] Created empty Database.txt. Add registered plate numbers to it, one per line.")
+            except IOError as e: print(f"[ERROR] Could not create Database.txt: {e}")
         else:
-            with open(DATABASE_FILE_PATH, 'r') as f: db_lines = len(f.readlines())
-            print(f"{DATABASE_FILE_PATH} found with {db_lines} entries.")
+            try:
+                with open('Database.txt', 'r') as f: db_lines = len(f.readlines())
+                print(f"Database.txt found with {db_lines} entries.")
+            except IOError as e: print(f"[ERROR] Could not read Database.txt: {e}")
 
-        initialize_log_file()
+
+        # --- Setup routines ---
         setup_gpio()
-        setup_lcd()
-        setup_camera()
+        setup_lcd()  # LCD setup includes an initial display
+        setup_camera() # Sets camera_ready global
         setup_servos()
 
-        if not camera_ready:
-            lcd_display_merged("ANPR Cam FAIL!", "Entry Disabled", clear_first=True)
-            print("[CRITICAL] ANPR Camera failed to initialize. Entry via ANPR will not work.")
+        if not camera_ready: # Display persistent warning if camera failed
+            lcd_display_merged("ANPR Cam FAIL!", "Entry by US Only", clear_first=True)
+            print("[CRITICAL] ANPR Camera failed to initialize. ANPR features will be disabled. Entry will rely on US sensor and availability.")
+            time.sleep(2) # Allow message to be read
 
-        anpr_last_plate_contour_detection_time = time.time()
-        anpr_last_process_time = time.time()
+        # Initialize ANPR timers
+        anpr_last_plate_contour_detection_time = time.time() # Initialize to current time
+        anpr_last_process_time = time.time() # Initialize to prevent immediate cooldown on first real plate
 
-        log_event("SYSTEM", status_message="System Startup")
+        # Initial system status display
         lcd_display_merged("System Ready", f"{available_spots_count} Spots Free", clear_first=True)
         print("\nCombined Parking & ANPR System Ready. Press Ctrl+C to quit.")
-        time.sleep(1)
+        time.sleep(1) # Short delay before main loop
 
+        # --- Main Loop ---
         while True:
             merged_main_loop()
-            time.sleep(IR_POLLING_INTERVAL_MAIN_LOOP)
+            time.sleep(IR_POLLING_INTERVAL_MAIN_LOOP) # Main loop tick rate
 
     except KeyboardInterrupt:
         print("\nCtrl+C Detected. Shutting down system...")
-        log_event("SYSTEM", status_message="System Shutdown Initiated")
     except Exception as e:
-        print(f"\n[CRITICAL ERROR] An unexpected error occurred: {e}")
+        print(f"\n[CRITICAL ERROR] An unexpected error occurred in main execution: {e}")
         import traceback
         traceback.print_exc()
-        log_event("SYSTEM", status_message=f"CRITICAL ERROR: {e}")
     finally:
         print("Cleaning up all resources...")
-        if lcd_ready and lcd is not None and hasattr(lcd, 'clear') and not isinstance(lcd, DummyLCD):
+        if lcd_ready and lcd is not None and not isinstance(lcd, DummyLCD): # Check if it's the real LCD
            try:
              lcd_display_merged("System Offline", "Goodbye!", clear_first=True)
              time.sleep(1)
              lcd.clear()
-           except Exception as lcd_e: print(f"Error clearing LCD: {lcd_e}")
-        
-        if servo_entry_pwm:
-            print("Closing entry servo PWM before exit...")
-            set_servo_angle_parking(servo_entry_pwm, ENTRY_GATE_CLOSED_ANGLE, "Entry Final Close")
-            time.sleep(0.5)
-            servo_entry_pwm.stop()
-        if servo_exit_pwm:
-            print("Closing exit servo PWM before exit...")
-            set_servo_angle_parking(servo_exit_pwm, EXIT_GATE_CLOSED_ANGLE, "Exit Final Close")
-            time.sleep(0.5)
-            servo_exit_pwm.stop()
-            
-        if camera_ready and picam2:
+           except: pass # Ignore errors during final cleanup
+        if servo_entry_pwm: servo_entry_pwm.stop()
+        if servo_exit_pwm: servo_exit_pwm.stop()
+        if picam2: # Check if picam2 object exists
             try:
-                print("Stopping camera...")
-                picam2.stop()
-                print("Camera stopped.")
-            except Exception as cam_e: print(f"Error stopping camera: {cam_e}")
-        
+                if camera_ready: picam2.stop() # Only stop if it was started
+                print("Camera stopped (if it was running).")
+            except Exception as e: print(f"Error stopping camera: {e}")
         GPIO.cleanup()
         print("GPIO Cleaned Up. System Exited.")
-        if os.path.exists(ACTIVITY_LOG_FILE_PATH):
-             log_event("SYSTEM", status_message="System Exited Cleanly")
